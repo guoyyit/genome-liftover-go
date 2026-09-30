@@ -1,0 +1,6 @@
+# chrom	start	end	name
+chr1	90	250	spans-two-gaps
+chr1	100	120	fully-mapped-plus
+chr2	0	120	minus-with-target-gap
+chr9	0	10	no-chain-here
+this-line-is-broken

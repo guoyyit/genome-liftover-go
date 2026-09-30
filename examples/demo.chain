@@ -1,0 +1,13 @@
+# Demo chain file (0-based half-open coordinates).
+# Plus-strand chain: target [100,340) -> query+ [50,300),
+# with target gaps [120,150) and [200,210).
+chain 10000 chr1 10000 + 100 340 chr1 9000 + 50 300 42
+20 30 10
+50 10 40
+130
+
+# Minus-strand chain: target [0,120) -> reverse query of size 5000,
+# containing a target gap [40,60).
+chain 9000 chr2 5000 + 0 120 chr2 5000 - 200 320 43
+40 20 20
+60
