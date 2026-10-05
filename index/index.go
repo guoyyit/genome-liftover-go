@@ -20,6 +20,10 @@ type chromIndex struct {
 	chains []*chain.Chain
 	starts []int
 	ends   []int
+	// maxEnd[i] is the maximum ends value over the implicit binary tree
+	// subtree rooted at position i (mid-split over the start-sorted array).
+	// It lets queries prune whole subtrees that cannot overlap.
+	maxEnd []int
 }
 
 // New builds an index from parsed chains.
@@ -88,12 +92,32 @@ func buildSpanIndex(spans []span) *chromIndex {
 		chains: make([]*chain.Chain, len(spans)),
 		starts: make([]int, len(spans)),
 		ends:   make([]int, len(spans)),
+		maxEnd: make([]int, len(spans)),
 	}
 	for i, s := range spans {
 		ci.chains[i] = s.c
 		ci.starts[i] = s.lo
 		ci.ends[i] = s.hi
 	}
+	// Annotate each node with the maximum end of its implicit subtree.
+	// Interval ends are always >= 0, so -1 is a safe empty sentinel.
+	var fill func(lo, hi int) int
+	fill = func(lo, hi int) int {
+		if lo >= hi {
+			return -1
+		}
+		mid := (lo + hi) / 2
+		m := fill(lo, mid)
+		if r := fill(mid+1, hi); r > m {
+			m = r
+		}
+		if ci.ends[mid] > m {
+			m = ci.ends[mid]
+		}
+		ci.maxEnd[mid] = m
+		return m
+	}
+	fill(0, len(spans))
 	return ci
 }
 
@@ -122,14 +146,30 @@ func (idx *IntervalIndex) querySide(side map[string]*chromIndex, chrom string, s
 	if ci == nil {
 		return nil
 	}
-	lo := sort.Search(len(ci.starts), func(i int) bool { return ci.ends[i] > start })
+	// Output-sensitive stabbing query over the start-sorted array, augmented
+	// with per-subtree maximum ends. Hits are emitted in-order, so the result
+	// stays ordered by (span start, chain ID) exactly as documented.
 	var hits []ChainHit
-	for i := lo; i < len(ci.starts); i++ {
-		if ci.starts[i] >= end {
-			break
+	var walk func(lo, hi int)
+	walk = func(lo, hi int) {
+		if lo >= hi {
+			return
 		}
-		hits = append(hits, ChainHit{Chain: ci.chains[i]})
+		mid := (lo + hi) / 2
+		if ci.maxEnd[mid] <= start {
+			return // no interval in this subtree ends after start
+		}
+		walk(lo, mid)
+		if ci.starts[mid] < end && ci.ends[mid] > start {
+			hits = append(hits, ChainHit{Chain: ci.chains[mid]})
+		}
+		if ci.starts[mid] < end {
+			// The right subtree may still contain intervals starting before
+			// end; otherwise every interval there starts at/after end.
+			walk(mid+1, hi)
+		}
 	}
+	walk(0, len(ci.starts))
 	return hits
 }
 

@@ -71,8 +71,13 @@ TSV 输入每行：`chrom<TAB>start<TAB>end[<TAB>name]`，空行与 `#` 开头�
 
 - 解析与批量处理均为流式（bufio.Scanner，64KiB 初始缓冲，单行上限 16/64MiB），
   不把输入文件整体载入内存。
-- 每条染色体维护按 start 排序的链数组，区间查询为二分定位 + 线性扫描重叠段，
-  复杂度约 O(log n + k)。
+- 每条染色体维护按 `(start, chain ID)` 排序的链数组，并在其上构建
+  **子树最大 end 增强的隐式区间树**（cgranges 式）：查询沿中序遍历，
+  用 `maxEnd <= start` 剪枝整棵子树，用 `start >= end` 剪掉右子树。
+  复杂度为输出敏感的 O(log n + k)（k 为命中数），命中顺序即排序数组顺序，
+  与文档约定一致。同一染色体上数千条链大量重叠时，候选集合与逐条精确
+  比较完全一致，不漏报、不误报未映射；查询耗时不随链总数线性增长
+  （见 `BenchmarkDenseQueryScaling`）。
 - query 侧索引保存的是**基因组坐标**区间：反向链（`qStrand=-`）的
   `qStart/qEnd` 为链坐标，构建索引时按 `qSize` 翻转为
   `[qSize-qEnd, qSize-qStart)`，因此反向查询可直接使用基因组坐标。
@@ -91,7 +96,11 @@ liftover batch --index ./idx --in in.tsv --workers 8
 - 写入采用「同目录临时文件 + fsync + 原子 rename + 目录 fsync」，
   写入中途失败只留下/清理临时文件，已有 `index.bin` 不会被截断或损坏。
 - 重载后的索引与新建索引对相同查询产生逐条一致结果（见
-  `TestSaveLoadRoundTrip`）。
+  `TestSaveLoadRoundTrip` 与密集数据上的 `TestDenseSaveLoadIdentical`）。
+- **兼容性**：本次密集重叠修复只改了内存中的查询算法，磁盘格式未变；
+  修复前落盘的 `LIFTIDX1` 索引继续可加载且语义一致（由金文件测试
+  `TestLoadGoldenV1Index` 锁定）。若未来格式演进，旧版本号会在加载时
+  给出可区分错误，重新执行 `liftover index build` 即可恢复。
 
 ## 输入校验
 
@@ -101,6 +110,46 @@ liftover batch --index ./idx --in in.tsv --workers 8
 - `truncated`：chain 缺少终止行、记录或 gzip 流被截断；
 - `corrupt`：block 无法重建 header 声明的起止、坐标越过染色体长度、
   gap 非法、校验和不符等语义/数据损坏。
+
+## 密集重叠场景的正确性
+
+同一染色体上数千条链大量重叠时，候选检索必须完整：任何与查询区间真实
+重叠（0 起始半开，端点相接不算重叠）的链都会作为候选返回，两个查询
+方向、正负链一致成立。历史上此处曾在按 start 排序的数组上对 end 做二分
+（end 在该顺序下非单调），导致密集数据漏候选、误报未映射；现已改为
+maxEnd 增强区间树并由以下自动化测试锁定：
+
+- `index.TestDenseOverlapMatchesBruteForce`：3000 条密集重叠链上，随机
+  区间 + 链首/链尾/端点相接/跨链边界查询，与逐条精确比较的参考实现
+  （`internal/testutil.Overlap`）逐一比对，两个方向同时验证；
+- `liftover.TestDenseCandidateCompleteness`：映射层候选集合与顺序
+  （分数降序、ID 升序决胜）同暴力参考一致；
+- `liftover.TestDenseRoundTrip`：完全落入对齐块内的区间经同一条链
+  往返映射恢复原区间，正负链各覆盖百余条；
+- `liftover.TestDenseGapSplit`：跨缺口区间拆分且片段不重不漏；
+- `batch.TestDenseBatchConcurrencyEquivalence`：1 与 8 worker 输出逐字节
+  一致、顺序与输入一致、统计与逐条映射参考一致；
+- `index.TestDenseSaveLoadIdentical`：密集索引重载后命中集合与序列化
+  字节完全一致；
+- `cmd/liftover.TestDenseCLIEndToEnd`：CLI 下 chain 文件与持久化索引
+  的批量输出逐字节一致。
+
+夹具由 `internal/testutil` 确定性生成（固定种子），不依赖每条染色体
+只有一两条链的合成数据，也不依赖任何外部文件或服务。
+
+## 验证方法
+
+全部验证均可离线重复执行：
+
+```sh
+go build ./...
+go vet ./...
+go test ./...          # 单元 + 密集夹具交叉验证
+go test -race ./...    # 并发一致性（无撕裂状态）
+
+# 查询耗时不随同染色体链数线性增长（重叠深度恒定，曲线应基本平坦）
+go test ./index/ -run=NONE -bench=BenchmarkDenseQueryScaling -benchtime=200x
+```
 
 ## 快速示例
 
