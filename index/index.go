@@ -20,6 +20,11 @@ type chromIndex struct {
 	chains []*chain.Chain
 	starts []int
 	ends   []int
+	// maxEnd is a segment tree over ends; it answers "leftmost index in a
+	// range whose end exceeds a value" in O(log n), which is required to
+	// find every overlap because ends are not monotone once many spans
+	// overlap.
+	tree maxEndTree
 }
 
 // New builds an index from parsed chains.
@@ -94,6 +99,7 @@ func buildSpanIndex(spans []span) *chromIndex {
 		ci.starts[i] = s.lo
 		ci.ends[i] = s.hi
 	}
+	ci.tree = newMaxEndTree(ci.ends)
 	return ci
 }
 
@@ -122,13 +128,21 @@ func (idx *IntervalIndex) querySide(side map[string]*chromIndex, chrom string, s
 	if ci == nil {
 		return nil
 	}
-	lo := sort.Search(len(ci.starts), func(i int) bool { return ci.ends[i] > start })
+	n := len(ci.starts)
+	// Only spans with start < end can overlap; this bound is exact because
+	// starts are sorted. Empty queries (start == end) never overlap.
+	limit := sort.Search(n, func(i int) bool { return ci.starts[i] >= end })
+	if start == end || limit == 0 {
+		return nil
+	}
+	// Among indices [0,limit), report exactly those with end > start. Ends
+	// are not monotone under heavy overlap, so the max-end tree locates each
+	// matching index in O(log n) while skipping ranges that contain none.
 	var hits []ChainHit
-	for i := lo; i < len(ci.starts); i++ {
-		if ci.starts[i] >= end {
-			break
-		}
+	i := ci.tree.firstAfter(0, limit, start)
+	for i >= 0 {
 		hits = append(hits, ChainHit{Chain: ci.chains[i]})
+		i = ci.tree.firstAfter(i+1, limit, start)
 	}
 	return hits
 }

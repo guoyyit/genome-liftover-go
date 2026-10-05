@@ -71,12 +71,29 @@ TSV 输入每行：`chrom<TAB>start<TAB>end[<TAB>name]`，空行与 `#` 开头�
 
 - 解析与批量处理均为流式（bufio.Scanner，64KiB 初始缓冲，单行上限 16/64MiB），
   不把输入文件整体载入内存。
-- 每条染色体维护按 start 排序的链数组，区间查询为二分定位 + 线性扫描重叠段，
-  复杂度约 O(log n + k)。
+- 每条染色体维护按 start（再按 chain ID）排序的链数组。区间查询分两步：
+  1. 二分定位最后一个 `start < end` 的位置（start 单调，上界精确）；
+  2. 在该前缀上用 **max-end 线段树** 逐个找出 `end > start` 的链。
+  这样在大量链相互重叠、end **不单调** 时也能返回全部真实重叠的链，
+  既不漏报也不误报（端点相接 `end == start` 不算重叠）。
+  复杂度约 O(log n + k log n)，k 为真实重叠链数；稀疏查询基本是 O(log n)，
+  **查询耗时不随该染色体链总数线性增长**。线段树为 O(n) 空间，索引内存与
+  链数量同阶，构建为 O(n log n)。
 - query 侧索引保存的是**基因组坐标**区间：反向链（`qStrand=-`）的
   `qStart/qEnd` 为链坐标，构建索引时按 `qSize` 翻转为
   `[qSize-qEnd, qSize-qStart)`，因此反向查询可直接使用基因组坐标。
 - 索引本身与链数量同阶；chain 是不可变共享对象，不会被批量 worker 复制。
+
+### 密集重叠正确性说明（修复点）
+
+旧实现在按 start 排序的数组上直接对 ends 做二分定位下界。当同一染色体上
+存在数千条相互重叠的链时，ends 并不单调：一条排在前面的长链（end 很大）
+会让二分把本应命中的更早长链跳过（**漏报、误判未映射**），而后续线性扫描
+又不复查 end，会把仅 start 落在区间内的短链误纳（**误报**）。正向/反向、
+target/query 两个方向都受影响。修复后候选集合与「逐条精确比较」的参考实现
+在数千条密集重叠链夹具上完全一致，覆盖链首端、末端、恰好相接、跨越边界等
+端点情形（见 `index/dense_test.go`、`liftover/dense_mapper_test.go`）。
+
 
 ## 索引持久化
 
@@ -90,8 +107,44 @@ liftover batch --index ./idx --in in.tsv --workers 8
   载入时校验魔数、版本、载荷完整性并重新 `Validate` 每条链。
 - 写入采用「同目录临时文件 + fsync + 原子 rename + 目录 fsync」，
   写入中途失败只留下/清理临时文件，已有 `index.bin` 不会被截断或损坏。
-- 重载后的索引与新建索引对相同查询产生逐条一致结果（见
-  `TestSaveLoadRoundTrip`）。
+- 重载后的索引与新建索引对相同查询产生逐条一致结果（候选集合、mapped/
+  unmapped 片段、分类计数），见 `TestSaveLoadRoundTrip` 与密集夹具上的
+  `TestDensePersistReloadEquivalence`、`TestDenseReloadConcurrentConsistency`。
+
+### 索引兼容性
+
+- 当前持久化格式仍为魔数 `LIFTIDX1`、版本 1，**格式未变化**：已经落盘的
+  旧索引无需重建即可直接加载，且查询结果与重建后完全一致（线段树在加载时
+  从链数组重新构建，不写入文件）。
+- 若未来格式/版本不被支持，载入会返回可区分的错误
+  `unsupported index version …`（魔数不符返回 `bad magic`，校验失败返回
+  `checksum mismatch`），绝不静默产生错误结果；此时用
+  `liftover index build --chain … --out …` 重新构建即可恢复。
+- 写入使用同目录临时文件 + fsync + 原子 rename + 目录 fsync；写入被中断时
+  已有的 `index.bin` 保持可加载且字节不变（见 `TestSaveFailureKeepsOldIndex`）。
+
+## 验证方法（本地可重复执行）
+
+全部离线、无外部服务/网络/凭据：
+
+```sh
+# 构建与完整测试
+go build ./...
+go test ./...
+
+# 竞态检测（并发批量与共享只读索引）
+go test -race ./...
+
+# 密集重叠专项（数千条相互重叠链、正反链、两个方向、端点/边界、
+# 跨 gap、多链歧义、往返、持久化重载、批量并发）
+go test ./... -run 'Dense|Minus|RoundTrip|Ambiguous' -v
+
+# 查询/构建的复杂度与内存随链数量的变化
+go test ./index/ -bench . -benchmem
+```
+
+测试夹具均在本地确定性生成（固定随机种子），并与逐条精确比较的参考实现
+交叉验证；稀疏查询在 1k→16k 链时耗时基本只随 log n 增长。
 
 ## 输入校验
 

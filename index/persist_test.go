@@ -134,3 +134,36 @@ func TestSaveFailureKeepsOldIndex(t *testing.T) {
 		t.Fatalf("temp file leaked, dir now has %d entries", len(entries))
 	}
 }
+
+// TestLoadVersionMismatchMessage ensures an unsupported index version yields
+// a distinguishable error (users can recover by rebuilding), rather than
+// silently producing wrong results.
+func TestLoadVersionMismatchMessage(t *testing.T) {
+	chains, _ := chain.ParseReader(strings.NewReader(persistInput))
+	dir := t.TempDir()
+	if err := New(chains).Save(dir); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, indexFileName)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Bump the version field (2 bytes right after the 8-byte magic) and
+	// truncate the checksum; version checking happens before checksum
+	// verification and must report the version mismatch clearly.
+	raw = append([]byte(nil), raw...)
+	raw[len(indexMagic)] = raw[len(indexMagic)] + 1
+	bad := filepath.Join(t.TempDir(), "b")
+	os.MkdirAll(bad, 0o755)
+	if err := os.WriteFile(filepath.Join(bad, indexFileName), raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err = Load(bad)
+	if err == nil {
+		t.Fatal("want error for unsupported index version")
+	}
+	if !strings.Contains(err.Error(), "unsupported index version") {
+		t.Fatalf("want distinguishable version error, got: %v", err)
+	}
+}
